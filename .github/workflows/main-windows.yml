@@ -1,0 +1,163 @@
+name: main-windows
+
+on:
+  workflow_run:
+    workflows: ['ci']
+    types: [completed]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+env:
+  DO_NOT_TRACK: 1
+  NEXT_TELEMETRY_DISABLED: 1
+
+jobs:
+  prepare:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      should_run: ${{ steps.meta.outputs.should_run }}
+    steps:
+      - name: Download create-payload-app packages
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: create-payload-app-packages
+          path: .artifacts/create-payload-app
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Set execution flag
+        id: meta
+        run: |
+          if [ "${{ steps.download.outcome }}" = "success" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set template matrix
+        id: matrix
+        run: |
+          cat <<'EOF' >> "$GITHUB_OUTPUT"
+          matrix={"include":[
+            {"template":"blank","db_args":"--db sqlite --db-accept-recommended"},
+            {"template":"website","db_args":"--db sqlite --db-accept-recommended"},
+            {"template":"ecommerce","db_args":"--db sqlite --db-accept-recommended"},
+            {"template":"with-cloudflare-d1","db_args":"--db sqlite --db-accept-recommended"},
+            {"template":"plugin","db_args":""}
+          ]}
+          EOF
+
+  create-payload-app-e2e:
+    name: windows-e2e-${{ matrix.template }}
+    needs: prepare
+    if: ${{ needs.prepare.outputs.should_run == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .tool-versions
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.27.0
+          run_install: false
+
+      - name: Download create-payload-app packages
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: create-payload-app-packages
+          path: .artifacts/create-payload-app
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Resolve artifact metadata
+        shell: pwsh
+        run: |
+          $manifest = Get-Content '.artifacts/create-payload-app/manifest.json' | ConvertFrom-Json
+          $projectName = "payload-app-${{ matrix.template }}"
+          $projectDir = Join-Path $env:RUNNER_TEMP $projectName
+          if (Test-Path $projectDir) {
+            Remove-Item -LiteralPath $projectDir -Recurse -Force
+          }
+
+          $createPayloadAppTgz = Resolve-Path (Join-Path '.artifacts/create-payload-app/packed-packages' $manifest.createPayloadAppPackage)
+          $packedPackagesDir = Resolve-Path '.artifacts/create-payload-app/packed-packages'
+
+          "CREATE_PAYLOAD_APP_TGZ=$($createPayloadAppTgz.Path)" >> $env:GITHUB_ENV
+          "PACKED_PACKAGES_DIR=$($packedPackagesDir.Path)" >> $env:GITHUB_ENV
+          "PAYLOAD_VERSION=$($manifest.version)" >> $env:GITHUB_ENV
+          "PROJECT_DIR=$projectDir" >> $env:GITHUB_ENV
+          "PROJECT_NAME=$projectName" >> $env:GITHUB_ENV
+
+      - name: Create project with create-payload-app
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          $createPayloadAppArgs = @(
+            $env:PROJECT_NAME
+            '--branch'
+            '${{ github.event.workflow_run.head_sha }}'
+            '--template'
+            '${{ matrix.template }}'
+            '--use-pnpm'
+            '--no-deps'
+            '--no-git'
+            '--version'
+            $env:PAYLOAD_VERSION
+          )
+
+          if ('${{ matrix.db_args }}') {
+            $createPayloadAppArgs += '${{ matrix.db_args }}'.Split(' ')
+          }
+
+          npx --yes --package="$env:CREATE_PAYLOAD_APP_TGZ" create-payload-app @createPayloadAppArgs
+
+      - name: Install local Payload packages
+        shell: pwsh
+        run: |
+          node scripts/install-project-with-local-payload-pkgs.mjs "$env:PROJECT_DIR" "$env:PACKED_PACKAGES_DIR"
+
+      - name: Install Playwright browser
+        shell: pwsh
+        run: |
+          Set-Location $env:PROJECT_DIR
+          pnpm exec playwright install chromium
+
+      - name: Run template E2E tests
+        shell: pwsh
+        env:
+          CI: true
+        run: |
+          Set-Location $env:PROJECT_DIR
+          pnpm run test:e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-playwright-report-${{ matrix.template }}-${{ github.event.workflow_run.id }}
+          path: ${{ runner.temp }}/payload-app-${{ matrix.template }}/playwright-report
+          if-no-files-found: ignore
+          retention-days: 7

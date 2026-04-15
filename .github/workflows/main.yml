@@ -37,14 +37,18 @@ jobs:
           filters: |
             needs_build:
               - '.github/workflows/main.yml'
+              - '.github/workflows/main-windows.yml'
               - 'packages/**'
+              - 'tools/**'
               - 'test/**'
               - 'pnpm-lock.yaml'
               - 'package.json'
               - 'templates/**'
             needs_tests:
               - '.github/workflows/main.yml'
+              - '.github/workflows/main-windows.yml'
               - 'packages/**'
+              - 'tools/**'
               - 'test/**'
               - 'pnpm-lock.yaml'
               - 'package.json'
@@ -86,6 +90,19 @@ jobs:
       - run: pnpm run build:all
         env:
           DO_NOT_TRACK: 1 # Disable Turbopack telemetry
+
+      - name: Pack create-payload-app packages
+        run: |
+          mkdir -p .artifacts/create-payload-app/packed-packages
+          pnpm run script:pack --all --no-build --dest .artifacts/create-payload-app/packed-packages
+          node --input-type=module -e "import fs from 'node:fs'; const artifactDir = '.artifacts/create-payload-app'; const packedDir = artifactDir + '/packed-packages'; const files = fs.readdirSync(packedDir).filter((file) => file.endsWith('.tgz')).sort(); const createPayloadAppPackage = files.find((file) => file.startsWith('create-payload-app-')); if (!createPayloadAppPackage) { throw new Error('Unable to find packed create-payload-app tarball'); } const version = JSON.parse(fs.readFileSync('package.json', 'utf8')).version; fs.writeFileSync(artifactDir + '/manifest.json', JSON.stringify({ createPayloadAppPackage, version }, null, 2) + '\n');"
+
+      - name: Upload create-payload-app packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: create-payload-app-packages
+          path: .artifacts/create-payload-app
+          retention-days: 7
 
       - name: Cache build
         uses: actions/cache@v4
